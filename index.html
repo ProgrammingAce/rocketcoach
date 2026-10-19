@@ -145,20 +145,38 @@ footer output{color:var(--text);font-variant-numeric:tabular-nums;min-width:36px
    CONST — arena geometry and physics (Unreal units, uu)
    World +y points at the orange goal (drawn right), +x is drawn up.
    ===================================================================== */
-const A = { X:4096, Y:5120, C:8064, GW:893, GD:6000, R:92.75 };
-const CAR = { L:118.0, W:84.2, OFF:13.9 };           // Octane hitbox
+// Values follow RocketSim (github.com/ZealanL/RocketSim, RLConst.h / CarConfig.cpp).
+// R is the ball's collision radius; RW is its standoff from walls (the arena mesh adds a ~1.9 uu
+// collision margin, which is why the ball rests at z=93.15). Goals score at |y| > GOAL_Y + R.
+const A = { X:4096, Y:5120, C:8064, GW:893, GD:6000, R:91.25, RW:93.15, GOAL_Y:5124.25 };
+const CAR = { L:120.507, W:86.6994, H:38.6591, OFF:13.8757, OZ:20.755 };   // Octane hitbox
+// Ground-plane slice of the 3D contact: a grounded ball (center z=93.15) sits above the top of a
+// grounded car's hitbox (car origin z=17), so it touches the box's top edge. In the plane that
+// means a smaller contact radius and a contact normal tilted upward by HIT_C (cosine).
+const BALL_Z = 93.15, CAR_Z = 17, HIT_DZ = BALL_Z-(CAR_Z+CAR.OZ+CAR.H/2);
+const HIT_R = Math.sqrt(A.R*A.R-HIT_DZ*HIT_DZ), HIT_C = HIT_R/A.R, HIT_S = HIT_DZ/A.R;
+const PSY_Z = 0.35;                                   // extra-impulse z scale (BALL_CAR_EXTRA_IMPULSE_Z_SCALE)
+const WALL_Y = 2.0;                                   // ball-wall friction ramp (RLBot ball-bounce model)
 const TICK = 1/120, DOT_DT = 0.05, ARROW_T = 0.5;     // velocity arrows show 0.5 s of travel
 const MAX_CAR = 2300, THROTTLE_MAX = 1410, BOOST_ACC = 991.67, MAX_BALL = 6000;
 const TH_MAX = 110 * Math.PI / 180;                   // forward reach only: cap the turn
-const PHYS_DEFAULT = { drag:0.0305, eWall:0.6, muWall:0.285, eCar:0.0, carMass:180, ballMass:30, psyFlat:0.35, cooldown:1/60, minSpeed:20 };
+const PHYS_DEFAULT = { drag:0.0305, eWall:0.6, muWall:0.285, eCar:0.0, muCar:2.0, carMass:180, ballMass:30, psyFlat:0.35, cooldown:1/60, minSpeed:20 };
 const PHYS_META = {
-  drag:['Ball drag /s',0.001], eWall:['Wall restitution',0.05], muWall:['Wall friction',0.01], eCar:['Car restitution',0.05],
+  drag:['Ball drag /s',0.001], eWall:['Wall restitution',0.05], muWall:['Wall friction',0.01], eCar:['Car restitution',0.05], muCar:['Car friction',0.05],
   carMass:['Car mass',1], ballMass:['Ball mass',1], psyFlat:['Hit flatten',0.05], cooldown:['Hit cooldown s',0.001], minSpeed:['Stop speed',1],
 };
 const PSY_SCALE = [[0,.65],[500,.65],[2300,.55],[4600,.30]];
 const TURN_R = [[0,145],[500,251],[1000,425],[1500,727],[1750,909],[2300,1136]];
-const WALL = [[893,-5120],[2944,-5120],[4096,-3968],[4096,3968],[2944,5120],[893,5120],[893,6000],[-893,6000],[-893,5120],
-  [-2944,5120],[-4096,3968],[-4096,-3968],[-2944,-5120],[-893,-5120],[-893,-6000],[893,-6000]];
+// Corner, sliced at z=1000 from the game's soccar collision mesh (RLUtilities assets/soccar/soccar_corner):
+// a 45° flat on |x|+|y|=8064 from (3200,4864) to (3840,4224), blended into the back and side walls by
+// r≈886 fillets made of flat facets. FILLET runs back wall → flat; mirroring it across the flat's
+// perpendicular, (x,y)→(−y−1024,−x−1024), gives the side-wall half.
+const FILLET = [[2559.8,-5120],[2630.7,-5117],[2731,-5105.5],[2816.7,-5086.7],[2899.3,-5059.8],[2978.5,-5024.8],
+  [3054.2,-4981.5],[3126,-4929.8],[3200,-4864]];
+const CORNER = [...FILLET, ...FILLET.map(([x,y])=>[-y-1024,-x-1024]).reverse()];   // x>0, y<0: back wall → side wall
+const WALL = [[893,-5120], ...CORNER, ...CORNER.map(([x,y])=>[x,-y]).reverse(), [893,5120],[893,6000],[-893,6000],[-893,5120],
+  ...CORNER.map(([x,y])=>[-x,-y]), ...CORNER.map(([x,y])=>[-x,y]).reverse(), [-893,-5120],[-893,-6000],[893,-6000]];
+const CLEAR_XY = 7679-A.RW*Math.SQRT2;                 // inside |x|<X−RW, |y|<Y−RW and this, no wall is in reach
 const SEGS = WALL.map((p,i)=>[p[0],p[1],WALL[(i+1)%WALL.length][0],WALL[(i+1)%WALL.length][1]]);
 const sym = (x,y)=>{ const s=new Set(), o=[]; for (const a of [1,-1]) for (const b of [1,-1]) { const k=(a*x)+','+(b*y); if(!s.has(k)){s.add(k);o.push([a*x,b*y]);} } return o; };
 const BIG_PADS = [[3072,4096],[3584,0]].flatMap(p=>sym(...p));
@@ -250,7 +268,7 @@ function carPose(car,t){
     return { x:ax+(bx-ax)*k, y:ay+(by-ay)*k, hdg:h, vx:moving?Math.cos(h)*car.speed:0, vy:moving?Math.sin(h)*car.speed:0 };
   }
   if (car.motion==='linear' && car.speed>0){
-    const maxD=Math.max(0, rayToWalls(car.x,car.y,c,s)-70), d=car.speed*t, moving=d<maxD, dd=Math.min(d,maxD);
+    const maxD=Math.max(0, rayToWalls(car.x,car.y,c,s)-(CAR.OFF+CAR.L/2)), d=car.speed*t, moving=d<maxD, dd=Math.min(d,maxD);
     return { x:car.x+c*dd, y:car.y+s*dd, hdg:car.hdg, vx:moving?c*car.speed:0, vy:moving?s*car.speed:0 };
   }
   return { x:car.x, y:car.y, hdg:car.hdg, vx:c*car.speed, vy:s*car.speed };  // 'still': holds position, speed feeds the hit
@@ -259,11 +277,10 @@ function carPose(car,t){
 function carContact(bx,by,p){
   const c=Math.cos(p.hdg), s=Math.sin(p.hdg), dx=bx-p.x, dy=by-p.y;
   const u=dx*c+dy*s-CAR.OFF, w=-dx*s+dy*c, hu=CAR.L/2, hw=CAR.W/2;
-  const cu=clamp(u,-hu,hu), cw=clamp(w,-hw,hw);
-  let nu=u-cu, nw=w-cw, d=Math.hypot(nu,nw);
-  if (d>=A.R) return null;
-  if (d<1e-6){ // center inside the box: push out along the axis of least penetration
-    if (hu-Math.abs(u) < hw-Math.abs(w)) { nu=Math.sign(u)||1; nw=0; } else { nu=0; nw=Math.sign(w)||1; }
+  let cu=clamp(u,-hu,hu), cw=clamp(w,-hw,hw), nu=u-cu, nw=w-cw, d=Math.hypot(nu,nw);
+  if (d>=HIT_R) return null;
+  if (d<1e-6){ // center inside the box: push out through the face of least penetration
+    if (hu-Math.abs(u) < hw-Math.abs(w)) { nu=Math.sign(u)||1; nw=0; cu=nu*hu; } else { nu=0; nw=Math.sign(w)||1; cw=nw*hw; }
     d=0;
   } else { nu/=d; nw/=d; }
   const nx=nu*c-nw*s, ny=nu*s+nw*c;
@@ -275,58 +292,68 @@ function carContact(bx,by,p){
  * events: wall | car | goal | stop.
  */
 function predict(fr,settings){
-  const P=settings.phys, R=A.R, N=Math.round(settings.horizon/TICK);
+  const P=settings.phys, R=A.R, RW=A.RW, N=Math.round(settings.horizon/TICK);
   const samples=new Float32Array((N+1)*5); let n=0;
   let x=fr.ball.x, y=fr.ball.y, vx=fr.ball.vx, vy=fr.ball.vy, touch=0, end='horizon', wasMoving=Math.hypot(vx,vy)>=P.minSpeed;
   const events=[], lastHit={};
   const push=(t)=>{ samples[n++]=t; samples[n++]=x; samples[n++]=y; samples[n++]=Math.hypot(vx,vy); samples[n++]=touch; };
   push(0);
-  const kCar=P.carMass/(P.carMass+P.ballMass);
+  const kCar=P.carMass/(P.carMass+P.ballMass), kSlip=1/(3.5+P.ballMass/P.carMass), cdTicks=Math.max(1,Math.round(P.cooldown/TICK));
   for (let i=1;i<=N;i++){
     const t=i*TICK;
     const kd=1-P.drag*TICK; vx*=kd; vy*=kd;
     let sp=Math.hypot(vx,vy); if (sp>MAX_BALL){ vx*=MAX_BALL/sp; vy*=MAX_BALL/sp; }
     x+=vx*TICK; y+=vy*TICK;
     if (settings.wallBounce){
-      for (const [ax,ay,bx,by] of SEGS){
+      const ax_=Math.abs(x), ay_=Math.abs(y);
+      if (!(ax_<A.X-RW && ay_<A.Y-RW && ax_+ay_<CLEAR_XY)) for (const [ax,ay,bx,by] of SEGS){
         const [cx,cy]=closestOnSeg(x,y,ax,ay,bx,by), dx=x-cx, dy=y-cy, d2=dx*dx+dy*dy;
-        if (d2>=R*R || d2<1e-12) continue;
+        if (d2>=RW*RW || d2<1e-12) continue;
         const d=Math.sqrt(d2), nx=dx/d, ny=dy/d, vn=vx*nx+vy*ny;
         if (vn<0){
           const sIn=Math.hypot(vx,vy);
-          let tx=vx-vn*nx, ty=vy-vn*ny; const vt=Math.hypot(tx,ty);
-          const kt=vt>1e-9?Math.max(0,1-P.muWall*(1+P.eWall)*Math.abs(vn)/vt):0;
+          // RLBot bounce model: dv_para = -min(1, Y|vn|/|s|)·mu·s, s = slip at the contact point.
+          // A rolling ball's spin adds only vertical slip at a wall (magnitude |vn|), so |s| includes it.
+          let tx=vx-vn*nx, ty=vy-vn*ny; const vt=Math.hypot(tx,ty), sl=Math.hypot(vt,vn);
+          const kt=1-P.muWall*Math.min(1,WALL_Y*Math.abs(vn)/sl);
           tx*=kt; ty*=kt;
           vx=tx-P.eWall*vn*nx; vy=ty-P.eWall*vn*ny;
           events.push({ t, x:cx, y:cy, kind:'wall', speedIn:sIn, speedOut:Math.hypot(vx,vy) });
         }
-        x=cx+nx*R; y=cy+ny*R;
+        x=cx+nx*RW; y=cy+ny*RW;
       }
     } else if (!insideArena(x,y) && !(Math.abs(x)<A.GW && Math.abs(y)<A.GD)){
       push(t); events.push({ t, x, y, kind:'out', speedIn:Math.hypot(vx,vy) }); end='out'; break;
     }
     if (settings.carBounce){
       for (const car of fr.cars){
-        if (lastHit[car.id]!==undefined && t-lastHit[car.id]<P.cooldown) continue;
         const p=carPose(car,t), hit=carContact(x,y,p);
         if (!hit) continue;
         const rvx=vx-p.vx, rvy=vy-p.vy, vn=rvx*hit.nx+rvy*hit.ny;
-        x=hit.px+hit.nx*R; y=hit.py+hit.ny*R;
+        x=hit.px+hit.nx*HIT_R; y=hit.py+hit.ny*HIT_R;
         if (vn>=0) continue;
         const sIn=Math.hypot(vx,vy), rs=Math.min(Math.hypot(rvx,rvy),4600);
-        // physical part: car treated as unstoppable, ball gets the mass-weighted normal impulse
-        const j=-(1+P.eCar)*kCar*vn; vx+=j*hit.nx; vy+=j*hit.ny;
-        // Psyonix extra impulse, flattened toward the car's sides
+        // Bullet contact: car mass-weighted normal impulse along the tilted 3D normal (its ground-plane
+        // part scales by HIT_C²), plus friction on the 3D slip at the contact point. A grounded ball
+        // rolls (ω = ẑ×v/R), so that point moves at (1−HIT_S)·v across the ground and HIT_C·(v·n) up.
+        // Stopping slip on a solid sphere moves its center by only 1/(1+5/2+m_b/m_c) of the slip.
+        const bn=vx*hit.nx+vy*hit.ny, wn=vn*HIT_C;
+        const sx=rvx-HIT_S*vx-wn*HIT_C*hit.nx, sy=rvy-HIT_S*vy-wn*HIT_C*hit.ny, sz=HIT_C*bn-wn*HIT_S, sv=Math.hypot(sx,sy,sz);
+        const J=-(1+P.eCar)*kCar*wn; vx+=J*HIT_C*hit.nx; vy+=J*HIT_C*hit.ny;
+        if (sv>1e-9){ const dv=Math.min(P.muCar*J,kSlip*sv); vx-=sx/sv*dv; vy-=sy/sv*dv; }
+        // Psyonix extra impulse (RocketSim Ball.cpp): at most once every cdTicks per car
+        if (lastHit[car.id]!==undefined && i-lastHit[car.id]<cdTicks) continue;
         const fx=Math.cos(p.hdg), fy=Math.sin(p.hdg);
-        let dx=x-p.x, dy=y-p.y; const df=dx*fx+dy*fy; dx-=P.psyFlat*df*fx; dy-=P.psyFlat*df*fy;
-        const dl=Math.hypot(dx,dy)||1, sc=interp(PSY_SCALE,rs)*rs;
-        vx+=dx/dl*sc; vy+=dy/dl*sc;
+        let hx=x-p.x, hy=y-p.y, hz=(BALL_Z-CAR_Z)*PSY_Z, hl=Math.hypot(hx,hy,hz); hx/=hl; hy/=hl; hz/=hl;
+        const df=hx*fx+hy*fy; hx-=P.psyFlat*df*fx; hy-=P.psyFlat*df*fy;
+        hl=Math.hypot(hx,hy,hz)||1; const sc=interp(PSY_SCALE,rs)*rs;
+        vx+=hx/hl*sc; vy+=hy/hl*sc;                     // the upward part pops the ball; only the ground part is kept
         sp=Math.hypot(vx,vy); if (sp>MAX_BALL){ vx*=MAX_BALL/sp; vy*=MAX_BALL/sp; }
-        lastHit[car.id]=t; touch=car.team==='blue'?1:2; wasMoving=true;
+        lastHit[car.id]=i; touch=car.team==='blue'?1:2; wasMoving=true;
         events.push({ t, x:hit.px, y:hit.py, kind:'car', carId:car.id, team:car.team, name:car.name, speedIn:sIn, speedOut:Math.hypot(vx,vy) });
       }
     }
-    if (Math.abs(y)>A.Y+R && Math.abs(x)<A.GW){
+    if (Math.abs(y)>A.GOAL_Y+R && Math.abs(x)<A.GW){
       push(t); events.push({ t, x, y, kind:'goal', side:y>0?'orange':'blue', speedIn:Math.hypot(vx,vy) }); end='goal'; break;
     }
     const s=Math.hypot(vx,vy);
@@ -972,7 +999,7 @@ cvM.addEventListener('pointerdown',e=>{
     return;
   }
   if (tool==='ball'){
-    const p=constrain(wx,wy,A.R); if (p){ fr.ball.x=p[0]; fr.ball.y=p[1]; select({ kind:'ball' }); }
+    const p=constrain(wx,wy,A.RW); if (p){ fr.ball.x=p[0]; fr.ball.y=p[1]; select({ kind:'ball' }); }
     ui.drag={ type:'ball', wx, wy, x0:fr.ball.x, y0:fr.ball.y }; return;
   }
   if (tool==='path'){
@@ -1013,7 +1040,7 @@ cvM.addEventListener('pointermove',e=>{
       if (d.path0){ const dx=c.x-d.x0, dy=c.y-d.y0; c.path=d.path0.map(([x,y])=>[x+dx,y+dy]); }
       d.changed=true; break;
     }
-    case 'ball':{ const p=constrain(d.x0+wx-d.wx, d.y0+wy-d.wy, A.R); if (p){ fr.ball.x=p[0]; fr.ball.y=p[1]; d.changed=true; } break; }
+    case 'ball':{ const p=constrain(d.x0+wx-d.wx, d.y0+wy-d.wy, A.RW); if (p){ fr.ball.x=p[0]; fr.ball.y=p[1]; d.changed=true; } break; }
     case 'carTip':{
       const c=getCar(d.id), [sx,sy]=w2s(view,c.x,c.y), dx=px-sx, dy=py-sy, dist=Math.hypot(dx,dy);
       let deg=90-Math.atan2(dx,-dy)*180/Math.PI; if (shift) deg=Math.round(deg/15)*15;
@@ -1435,9 +1462,12 @@ function selftest(){
   const F=(ball,cars=[])=>({ ball, cars, marks:[] });
   let tr=predict(F({x:0,y:0,vx:2000,vy:0}),S), e=tr.events.find(e=>e.kind==='wall');
   ok('side wall: 0.6× speed, straight back', e && Math.abs(e.speedOut/e.speedIn-0.6)<0.01 && Math.abs(e.y)<1, e&&(e.speedOut/e.speedIn).toFixed(3));
-  tr=predict(F({x:2000,y:2000,vx:1500,vy:1500}),S); e=tr.events.find(e=>e.kind==='wall');
+  tr=predict(F({x:2000,y:3024,vx:1500,vy:1500}),S); e=tr.events.find(e=>e.kind==='wall');
   { const i=Math.round(e.t/TICK)+2, S5=tr.samples, dx=S5[i*5+1]-S5[(i-1)*5+1], dy=S5[i*5+2]-S5[(i-1)*5+2], ang=Math.atan2(dy,dx)*180/Math.PI;
-    ok('chamfer head-on reflects along normal', e && Math.abs(ang+135)<2, ang.toFixed(1)+'°'); }
+    ok('corner flat head-on reflects along normal', e && Math.abs(ang+135)<2, ang.toFixed(1)+'°'); }
+  tr=predict(F({x:3900,y:0,vx:0,vy:2000}),S); e=tr.events.find(e=>e.kind==='wall');
+  { const i=Math.round(e.t/TICK)+2, S5=tr.samples, dx=S5[i*5+1]-S5[(i-1)*5+1], dy=S5[i*5+2]-S5[(i-1)*5+2], ang=Math.atan2(dy,dx)*180/Math.PI;
+    ok('corner fillet deflects toward the field', e && e.x>3840 && e.y>3584 && e.y<4224 && Math.abs(ang)>100, `${Math.round(e.x)},${Math.round(e.y)} ${ang.toFixed(1)}°`); }
   tr=predict(F({x:0,y:0,vx:0,vy:3000}),S); e=tr.events.find(e=>e.kind==='goal');
   ok('shot at mouth center scores', e && e.side==='orange' && e.t>1.70 && e.t<1.85, e&&e.t.toFixed(3)+'s');
   tr=predict(F({x:893,y:0,vx:0,vy:3000}),S);
@@ -1448,9 +1478,16 @@ function selftest(){
   const mover=mkCar('blue',0,-400,Math.PI/2,{ speed:1400 });
   tr=predict(F({x:0,y:0,vx:0,vy:0},[mover]),S); e=tr.events.find(e=>e.kind==='car');
   ok('1400 uu/s car hit → ~1700–2300 ball', e && e.speedOut>1700 && e.speedOut<2300, e&&Math.round(e.speedOut));
+  tr=predict(F({x:0,y:-2000,vx:1500,vy:1500}),S); e=tr.events.find(e=>e.kind==='wall');
+  { const i=Math.round(e.t/TICK)+2, S5=tr.samples, vy=(S5[i*5+2]-S5[(i-1)*5+2])/TICK, vx=(S5[i*5+1]-S5[(i-1)*5+1])/TICK, vin=1500*(1-0.0305*e.t);
+    ok('45° side wall: keeps 71.5% tangent, 0.6× normal', Math.abs(vy/vin-0.715)<0.01 && Math.abs(-vx/vin-0.6)<0.01, `${(vy/vin).toFixed(3)}, ${(-vx/vin).toFixed(3)}`); }
+  tr=predict(F({x:0,y:4900,vx:0,vy:100}),S); e=tr.events.find(e=>e.kind==='goal');
+  ok('goal counts at y > 5124.25 + 91.25', e && Math.abs(e.y-5215.5)<2, e&&e.y.toFixed(1));
   const side=mkCar('orange',0,1000,0,{ motion:'still' });
   tr=predict(F({x:0,y:0,vx:0,vy:6000},[side]),S);
   ok('6000 uu/s ball does not tunnel through car', tr.events.some(e=>e.kind==='car'));
+  { const pc=carPose(side,0), h=carContact(side.x+20,side.y+30,pc);
+    ok('ball placed inside a car is pushed clear of it', h && !carContact(h.px+h.nx*HIT_R,h.py+h.ny*HIT_R,pc)); }
   const g=reachGrid(1400,false,0.75); let sym=true;
   for (let j=0;j<g.rows;j++) for (let i=0;i<g.cols;i++){ const a=g.time[j*g.cols+i], b=g.time[(g.rows-1-j)*g.cols+i]; if (!(a===b || Math.abs(a-b)<1e-5)) sym=false; }
   ok('bean is left/right symmetric', sym);
